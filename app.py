@@ -5,7 +5,7 @@ from Crypto.Util.Padding import pad
 from google.protobuf.json_format import MessageToJson
 import binascii, aiohttp, requests, json
 import like_pb2, like_count_pb2, uid_generator_pb2
-import time, random, os, jwt
+import time, random, os, jwt, threading
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 import urllib3
@@ -24,15 +24,11 @@ tracker = defaultdict(lambda: [0, time.time()])
 liked_cache = defaultdict(set)
 
 # ===== TOKEN FILES =====
-# ⚠️ Vercel-এ filesystem read-only, তাই শুধু /tmp ব্যবহার করা যাবে
-# কিন্তু /tmp persistent না — তাই production-এ DB/Redis recommended
-TOKEN_DIR = "/tmp"
-
 TOKEN_FILES = {
-    "IND": f"{TOKEN_DIR}/token_ind.json",
-    "BR":  f"{TOKEN_DIR}/token_br.json",
-    "BD":  f"{TOKEN_DIR}/token_bd.json",
-    "RU":  f"{TOKEN_DIR}/token_ru.json",
+    "IND": "token_ind.json",
+    "BR":  "token_br.json",
+    "BD":  "token_bd.json",
+    "RU":  "token_ru.json",
 }
 ACCOUNT_FILES = {
     "IND": "account_ind.txt",
@@ -60,9 +56,10 @@ REL_V = "OB55"
 JWT_CONCURRENCY     = 50
 LIKE_CONCURRENCY    = 50
 JWT_TIMEOUT         = 30
+
+CHECK_INTERVAL_MIN  = 30
 TOKEN_MIN_VALIDITY  = 1800
 
-# ===== HELPERS =====
 def midnight():
     n = datetime.now()
     return datetime(n.year, n.month, n.day).timestamp()
@@ -72,7 +69,8 @@ def is_placeholder(u, p):
     return u.lower() in bad or p.lower() in bad
 
 def load_file(fn):
-    accs, seen = [], set()
+    accs = []
+    seen = set()
     if not os.path.exists(fn):
         return accs
     try:
@@ -106,14 +104,24 @@ def load_accounts(s):
         primary = "account_ind.txt"
     a = load_file(primary)
     if a:
+        print(f"Loaded {len(a)} accounts from {primary} for {s}")
         return a
     for fb in ["account_ind.txt", "account_br.txt", "account_bd.txt", "account_ru.txt"]:
         if fb == primary:
             continue
         a = load_file(fb)
         if a:
+            print(f"⚠️ Fallback: loaded {len(a)} accounts from {fb} for {s}")
             return a
     return []
+
+def load_accounts_by_file():
+    result = {}
+    for srv, fn in ACCOUNT_FILES.items():
+        a = load_file(fn)
+        if a:
+            result[srv] = a
+    return result
 
 def save_tokens_for_server(server, uids):
     fname = TOKEN_FILES.get(server)
@@ -140,8 +148,10 @@ def save_tokens_for_server(server, uids):
         }
         with open(fname, "w") as f:
             json.dump(data, f, indent=2)
+        print(f"💾 Saved {len(tokens)} tokens → {fname}")
         return True
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Failed to save {fname}: {e}")
         return False
 
 def load_tokens_from_file(server):
@@ -153,6 +163,7 @@ def load_tokens_from_file(server):
             data = json.load(f)
         now = datetime.now(timezone.utc)
         loaded = 0
+        skipped = 0
         for uid, c in (data.get("tokens") or {}).items():
             try:
                 exp = datetime.fromisoformat(c["expires_at"])
@@ -165,14 +176,21 @@ def load_tokens_from_file(server):
                         "fetched_at": c.get("fetched_at", time.time()),
                     }
                     loaded += 1
+                else:
+                    skipped += 1
             except Exception:
                 continue
+        print(f"📂 Loaded {loaded} tokens from {fname} (skipped {skipped} expired)")
         return loaded
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Failed to load {fname}: {e}")
         return 0
 
 def load_all_tokens_from_files():
-    return sum(load_tokens_from_file(s) for s in TOKEN_FILES.keys())
+    total = 0
+    for srv in TOKEN_FILES.keys():
+        total += load_tokens_from_file(srv)
+    return total
 
 async def fetch_raw(session, uid, pwd):
     try:
@@ -192,9 +210,19 @@ def token_is_valid(uid):
     if not c:
         return False
     try:
-        return (c["expires_at"] - datetime.now(timezone.utc)).total_seconds() > TOKEN_MIN_VALIDITY
+        remaining = (c["expires_at"] - datetime.now(timezone.utc)).total_seconds()
+        return remaining > TOKEN_MIN_VALIDITY
     except Exception:
         return False
+
+def token_time_left(uid):
+    c = TOKEN_CACHE.get(uid)
+    if not c:
+        return -1
+    try:
+        return (c["expires_at"] - datetime.now(timezone.utc)).total_seconds()
+    except Exception:
+        return -1
 
 async def get_valid_token(session, uid, pwd, force=False):
     if not force and token_is_valid(uid):
@@ -266,12 +294,16 @@ def region_matches(acc_region, target):
     return True
 
 async def prewarm_tokens(accs, server=None, force=False):
-    need_fetch, already_valid = [], []
+    need_fetch = []
+    already_valid = []
     for a in accs:
         if not force and token_is_valid(a['uid']):
             already_valid.append(a)
         else:
             need_fetch.append(a)
+
+    tag = server or "ALL"
+    print(f"🔎 Prewarm[{tag}]: {len(already_valid)} cached valid, {len(need_fetch)} need fetch")
 
     valid_fetched = []
     if need_fetch:
@@ -282,21 +314,23 @@ async def prewarm_tokens(accs, server=None, force=False):
             async def one(a):
                 async with sem:
                     t = await get_valid_token(session, a['uid'], a['password'], force=force)
-                    return a if t else None
+                    if not t:
+                        return None
+                    return a
             results = await asyncio.gather(*[one(a) for a in need_fetch], return_exceptions=True)
         valid_fetched = [r for r in results if isinstance(r, dict)]
 
     combined = already_valid + valid_fetched
 
     if server is not None:
-        combined = [
-            a for a in combined
-            if region_matches(
-                region_of((TOKEN_CACHE.get(a['uid']) or {}).get("login_url"),
-                          (TOKEN_CACHE.get(a['uid']) or {}).get("region")),
-                server
-            )
-        ]
+        filtered = []
+        for a in combined:
+            c = TOKEN_CACHE.get(a['uid']) or {}
+            if region_matches(region_of(c.get("login_url"), c.get("region")), server):
+                filtered.append(a)
+        combined = filtered
+
+    print(f"✅ Prewarm[{tag}]: {len(combined)}/{len(accs)} valid")
     return combined
 
 async def broadcast_likes(target, server, url, valid_accs):
@@ -351,23 +385,56 @@ def get_info(enc_uid, server, token):
         'X-Unity-Version': UNITY_V
     }
     try:
-        r = requests.post(f"{url}/GetPlayerPersonalShow",
-                          data=bytes.fromhex(enc_uid), headers=h,
-                          verify=False, timeout=10)
+        r = requests.post(f"{url}/GetPlayerPersonalShow", data=bytes.fromhex(enc_uid), headers=h, verify=False, timeout=10)
         return decode(r.content)
     except Exception:
         return None
 
-# ===== ROUTES =====
-@app.route('/')
-def home():
-    return jsonify({
-        "status": "online",
-        "credit": CREDIT,
-        "channel": CHANNEL,
-        "servers": list(URLS.keys()),
-        "usage": "/like?uid=<UID>&server_name=<SERVER>"
-    })
+def refresh_expired_tokens():
+    grouped = load_accounts_by_file()
+    if not grouped:
+        print("⚠️ No account files found")
+        return 0
+
+    total_refreshed = 0
+    for srv, accs in grouped.items():
+        expired = [a for a in accs if not token_is_valid(a['uid'])]
+        if not expired:
+            print(f"✅ {srv}: all {len(accs)} tokens valid — skip")
+            continue
+
+        truly_expired = [a for a in expired if token_time_left(a['uid']) <= 0]
+        near_expiry   = [a for a in expired if 0 < token_time_left(a['uid']) <= TOKEN_MIN_VALIDITY]
+        print(f"🔄 {srv}: {len(truly_expired)} expired, {len(near_expiry)} expiring soon — refreshing {len(expired)}")
+
+        t0 = time.time()
+        valid = asyncio.run(prewarm_tokens(expired, server=None, force=False))
+        dt = round(time.time() - t0, 2)
+        print(f"✅ {srv} refreshed — {len(valid)}/{len(expired)} valid in {dt}s")
+
+        uids = [a['uid'] for a in accs if a['uid'] in TOKEN_CACHE]
+        save_tokens_for_server(srv, uids)
+        total_refreshed += len(valid)
+    return total_refreshed
+
+def scheduler_loop():
+    loaded = load_all_tokens_from_files()
+    print(f"📂 Total loaded from files: {loaded}")
+
+    if loaded == 0:
+        print("⚠️ No cached tokens — initial fetch needed")
+        try:
+            refresh_expired_tokens()
+        except Exception as e:
+            print(f"⚠️ Initial fetch failed: {e}")
+
+    while True:
+        time.sleep(CHECK_INTERVAL_MIN * 60)
+        try:
+            print(f"⏰ {CHECK_INTERVAL_MIN}min check — scanning for expired tokens...")
+            refresh_expired_tokens()
+        except Exception as e:
+            print(f"⚠️ Scheduled check failed: {e}")
 
 @app.route('/like')
 def like():
@@ -379,9 +446,6 @@ def like():
         return jsonify({"error": "UID and server_name required"}), 400
     if server not in URLS:
         return jsonify({"error": f"Invalid server. Use: {list(URLS.keys())}"}), 400
-
-    # Load cached tokens from /tmp (if any) at request time
-    load_all_tokens_from_files()
 
     accs = load_accounts(server)
     if not accs:
@@ -429,11 +493,6 @@ def like():
         if given > 0:
             tracker[ip][0] += 1
             cnt += 1
-        # Persist refreshed tokens for next warm invocation
-        try:
-            save_tokens_for_server(server, [x['uid'] for x in accs if x['uid'] in TOKEN_CACHE])
-        except Exception:
-            pass
         return jsonify({
             "LikesGivenByAPI": given,
             "LikesafterCommand": al,
@@ -454,22 +513,23 @@ def like():
 def reset_limit():
     ip = request.remote_addr
     tracker[ip] = [0, time.time()]
-    return jsonify({"message": "Limit reset", "ip": ip, "remains": f"({KEY_LIMIT}/{KEY_LIMIT})"})
+    return jsonify({
+        "message": "Limit reset",
+        "ip": ip,
+        "remains": f"({KEY_LIMIT}/{KEY_LIMIT})"
+    })
 
-# NOTE: Vercel serverless — no threading / scheduler_loop here.
-# Use Vercel Cron for periodic token refresh (see vercel.json cron).
-@app.route('/cron/refresh')
-def cron_refresh():
-    """Called by Vercel Cron. Add crons in vercel.json."""
-    load_all_tokens_from_files()
-    count = 0
-    for srv in ACCOUNT_FILES.keys():
-        accs = load_accounts(srv)
-        if not accs:
-            continue
-        asyncio.run(prewarm_tokens(accs, server=None, force=False))
-        save_tokens_for_server(srv, [a['uid'] for a in accs if a['uid'] in TOKEN_CACHE])
-        count += 1
-    return jsonify({"refreshed_servers": count})
-
-# Vercel entrypoint name must be `app`
+if __name__ == '__main__':
+    print("🔥 Ayan Bro Like API — Server Starting")
+    print(f"📢 Channel : {CHANNEL}")
+    print(f"👤 Credit  : {CREDIT}")
+    print(f"Supported servers: {list(URLS.keys())}")
+    print(f"Speed: JWT={JWT_CONCURRENCY}x, LIKE={LIKE_CONCURRENCY}x")
+    print(f"Token check: every {CHECK_INTERVAL_MIN} min")
+    
+    # ব্যাকগ্রাউন্ডে টোকেন আপডেটের থ্রেড চালু
+    threading.Thread(target=scheduler_loop, daemon=True).start()
+    
+    # Render নিজে থেকেই PORT ধরে নিবে, না পেলে 5001 এ চলবে
+    port = int(os.environ.get("PORT", 5001))
+    app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
